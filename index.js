@@ -1,16 +1,19 @@
 "use strict";
 
-// Ultra-early log so we know THIS file is running (before any require can crash)
+// Ultra-early log so we know THIS file is running
 console.log("[BOOT] index.js starting...");
 console.log("[BOOT] Node", process.version, "CWD", process.cwd());
 console.log("[BOOT] JS_FILE env:", process.env.JS_FILE || "(not set)");
-console.log("[BOOT] PORT env:", process.env.PORT || "(not set, will use 3000)");
+console.log("[BOOT] PORT env:", process.env.PORT || "(not set)");
+console.log("[BOOT] SERVER_PORT env:", process.env.SERVER_PORT || "(not set)");
 
-const PORT = Number(process.env.PORT) || 3000;
+// Wispbyte / Pterodactyl usually inject SERVER_PORT (not PORT)
+const PORT = Number(process.env.PORT || process.env.SERVER_PORT) || 3000;
+console.log("[BOOT] Using listen port:", PORT);
 
-// Keep process alive no matter what (even if requires fail)
+// Keep process alive no matter what
 process.stdin.resume();
-setInterval(() => {}, 1 << 30); // keeps event loop busy
+setInterval(() => {}, 1 << 30);
 
 process.on("SIGTERM", () => console.log("[System] SIGTERM ignored"));
 process.on("SIGINT", () => console.log("[System] SIGINT ignored"));
@@ -45,7 +48,6 @@ try {
   console.error("[BOOT] Express failed:", e.message);
 }
 
-// Load bot deps after server is up
 let addLog, getLogs, mineflayer, pathfinder, config, governor;
 try {
   ({ addLog, getLogs } = require("./logger"));
@@ -57,7 +59,6 @@ try {
 } catch (e) {
   console.error("[BOOT] Module load failed:", e.message);
   console.error(e.stack);
-  // Stay alive so panel does not mark offline — fix modules and restart
   return;
 }
 

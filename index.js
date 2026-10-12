@@ -1,82 +1,105 @@
 "use strict";
 
-const { addLog, getLogs } = require("./logger");
-const mineflayer = require("mineflayer");
-const { pathfinder } = require("mineflayer-pathfinder");
-const config = require("./settings.json");
-const express = require("express");
-const http = require("http");
-const https = require("https");
-const governor = require("./cpuGovernor");
+// Ultra-early log so we know THIS file is running (before any require can crash)
+console.log("[BOOT] index.js starting...");
+console.log("[BOOT] Node", process.version, "CWD", process.cwd());
+console.log("[BOOT] JS_FILE env:", process.env.JS_FILE || "(not set)");
+console.log("[BOOT] PORT env:", process.env.PORT || "(not set, will use 3000)");
 
-// ============================================================
-// EXPRESS - Wispbyte / Render keep-alive (MUST bind open port)
-// ============================================================
-const app = express();
-app.use(express.json());
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
+
+// Keep process alive no matter what (even if requires fail)
+process.stdin.resume();
+setInterval(() => {}, 1 << 30); // keeps event loop busy
+
+process.on("SIGTERM", () => console.log("[System] SIGTERM ignored"));
+process.on("SIGINT", () => console.log("[System] SIGINT ignored"));
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] uncaughtException:", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] unhandledRejection:", reason);
+});
+
+let express, app, server;
+try {
+  express = require("express");
+  app = express();
+  app.get("/", (_req, res) => res.send("Bot is running!"));
+  app.get("/ping", (_req, res) => res.send("pong"));
+  app.get("/health", (_req, res) =>
+    res.json({ ok: true, uptime: process.uptime(), port: PORT })
+  );
+  server = app.listen(PORT, "0.0.0.0", () => {
+    console.log("[Server] HTTP keep-alive listening on 0.0.0.0:" + PORT);
+  });
+  server.on("error", (err) => {
+    console.error("[Server] listen error:", err.message);
+    if (err.code === "EADDRINUSE") {
+      const fb = PORT + 1;
+      console.log("[Server] trying port", fb);
+      try { server.listen(fb, "0.0.0.0"); } catch (e) {}
+    }
+  });
+} catch (e) {
+  console.error("[BOOT] Express failed:", e.message);
+}
+
+// Load bot deps after server is up
+let addLog, getLogs, mineflayer, pathfinder, config, governor;
+try {
+  ({ addLog, getLogs } = require("./logger"));
+  mineflayer = require("mineflayer");
+  ({ pathfinder } = require("mineflayer-pathfinder"));
+  config = require("./settings.json");
+  governor = require("./cpuGovernor");
+  console.log("[BOOT] All modules loaded OK");
+} catch (e) {
+  console.error("[BOOT] Module load failed:", e.message);
+  console.error(e.stack);
+  // Stay alive so panel does not mark offline — fix modules and restart
+  return;
+}
+
+function log(msg) {
+  try { addLog(msg); } catch (_) { console.log(msg); }
+}
+
+log("=".repeat(50));
+log("  Minecraft AFK Bot - Wispbyte Edition");
+log("=".repeat(50));
+log("Server: " + config.server.ip + ":" + config.server.port);
+log("Version: " + config.server.version);
+log("Keep-alive PORT: " + PORT);
+log("=".repeat(50));
+
+try { governor.start(); } catch (e) { log("[Governor] start failed: " + e.message); }
 
 let bot = null;
 let isReconnecting = false;
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
-
 const botState = {
   connected: false,
-  lastActivity: Date.now(),
   reconnectAttempts: 0,
   startTime: Date.now(),
-  errors: [],
 };
 
-app.get("/", (req, res) => {
-  res.send("Bot is running!");
-});
-
-app.get("/health", (req, res) => {
-  res.json({
-    status: botState.connected ? "connected" : "disconnected",
-    uptime: Math.floor((Date.now() - botState.startTime) / 1000),
-    coords: bot && bot.entity ? bot.entity.position : null,
-    reconnectAttempts: botState.reconnectAttempts,
+if (app) {
+  app.get("/logs", (_req, res) => {
+    try {
+      res.type("text/plain").send(getLogs().join("\n") || "No logs yet");
+    } catch (e) {
+      res.status(500).send(String(e.message));
+    }
   });
-});
-
-app.get("/ping", (req, res) => res.send("pong"));
-
-app.get("/logs", (req, res) => {
-  res.type("text/plain").send(getLogs().join("\n") || "No logs yet");
-});
-
-const server = app.listen(PORT, "0.0.0.0", () => {
-  addLog(`[Server] HTTP keep-alive on port ${server.address().port}`);
-});
-
-server.on("error", (err) => {
-  addLog(`[Server] error: ${err.message}`);
-  if (err.code === "EADDRINUSE") {
-    const fb = Number(PORT) + 1;
-    addLog(`[Server] trying fallback port ${fb}`);
-    try { server.listen(fb, "0.0.0.0"); } catch (e) {}
-  }
-});
-
-// ============================================================
-// Governor
-// ============================================================
-governor.start();
-governor.onChange((low) => {
-  addLog(`[Governor] ${low ? "LOW POWER mode ON" : "Normal mode"}`);
-});
-
-// ============================================================
-// Bot
-// ============================================================
-function clearBotTimeouts() {
-  if (connectionTimeoutId) {
-    clearTimeout(connectionTimeoutId);
-    connectionTimeoutId = null;
-  }
+  app.get("/status", (_req, res) => {
+    res.json({
+      connected: botState.connected,
+      attempts: botState.reconnectAttempts,
+      uptime: Math.floor(process.uptime()),
+    });
+  });
 }
 
 function scheduleReconnect() {
@@ -86,7 +109,7 @@ function scheduleReconnect() {
   const base = (config.utils && config.utils["auto-reconnect-delay"]) || 2000;
   const max = (config.utils && config.utils["max-reconnect-delay"]) || 120000;
   const delay = Math.min(base * Math.min(botState.reconnectAttempts, 10), max);
-  addLog(`[Bot] Reconnect in ${Math.round(delay / 1000)}s (attempt ${botState.reconnectAttempts})`);
+  log("[Bot] Reconnect in " + Math.round(delay / 1000) + "s (attempt " + botState.reconnectAttempts + ")");
   if (reconnectTimeoutId) clearTimeout(reconnectTimeoutId);
   reconnectTimeoutId = setTimeout(() => {
     isReconnecting = false;
@@ -95,16 +118,10 @@ function scheduleReconnect() {
 }
 
 function createBot() {
-  if (isReconnecting) {
-    addLog("[Bot] Already reconnecting, skip");
-    return;
-  }
+  if (isReconnecting) return;
 
   if (bot) {
-    try {
-      bot.removeAllListeners();
-      bot.end();
-    } catch (_) {}
+    try { bot.removeAllListeners(); bot.end(); } catch (_) {}
     bot = null;
   }
 
@@ -115,7 +132,7 @@ function createBot() {
       ? config.server.version
       : false;
 
-  addLog(`[Bot] Connecting to ${host}:${port} (version=${version || "auto"})`);
+  log("[Bot] Connecting to " + host + ":" + port + " (version=" + (version || "auto") + ")");
 
   try {
     bot = mineflayer.createBot({
@@ -129,46 +146,34 @@ function createBot() {
       checkTimeoutInterval: 600000,
     });
 
-    try {
-      bot.loadPlugin(pathfinder);
-    } catch (e) {
-      addLog(`[Bot] pathfinder load warning: ${e.message}`);
+    try { bot.loadPlugin(pathfinder); } catch (e) {
+      log("[Bot] pathfinder: " + e.message);
     }
 
-    clearBotTimeouts();
+    if (connectionTimeoutId) clearTimeout(connectionTimeoutId);
     connectionTimeoutId = setTimeout(() => {
       if (!botState.connected) {
-        addLog("[Bot] Connection timeout - no spawn");
-        try {
-          bot.removeAllListeners();
-          bot.end();
-        } catch (_) {}
+        log("[Bot] Connection timeout");
+        try { bot.removeAllListeners(); bot.end(); } catch (_) {}
         bot = null;
         botState.connected = false;
         scheduleReconnect();
       }
     }, 60000);
 
-    bot.once("login", () => {
-      addLog("[Bot] Logged in");
-      botState.lastActivity = Date.now();
-    });
+    bot.once("login", () => log("[Bot] Logged in"));
 
     bot.once("spawn", () => {
-      clearBotTimeouts();
+      if (connectionTimeoutId) clearTimeout(connectionTimeoutId);
       botState.connected = true;
       botState.reconnectAttempts = 0;
-      botState.lastActivity = Date.now();
-      addLog("[Bot] Spawned on server");
+      log("[Bot] Spawned on server");
 
       try {
         if (config.utils && config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
           const pw = config.utils["auto-auth"].password;
           setTimeout(() => {
-            try {
-              bot.chat(`/login ${pw}`);
-              addLog("[Bot] Sent /login");
-            } catch (_) {}
+            try { bot.chat("/login " + pw); log("[Bot] Sent /login"); } catch (_) {}
           }, 1500);
         }
       } catch (_) {}
@@ -176,73 +181,41 @@ function createBot() {
       if (config.utils && config.utils["anti-afk"] && config.utils["anti-afk"].enabled) {
         setInterval(() => {
           if (!bot || !bot.entity) return;
-          if (governor.isLow()) return;
           try {
+            if (governor && governor.isLow && governor.isLow()) return;
             bot.setControlState("jump", true);
             setTimeout(() => {
               try { bot.setControlState("jump", false); } catch (_) {}
             }, 400);
           } catch (_) {}
-        }, governor.scale(30000));
+        }, 30000);
       }
     });
 
     bot.on("end", (reason) => {
-      addLog(`[Bot] Disconnected: ${reason || "end"}`);
+      log("[Bot] Disconnected: " + (reason || "end"));
       botState.connected = false;
       bot = null;
-      if (config.utils && config.utils["auto-reconnect"] !== false) {
-        scheduleReconnect();
-      }
+      if (!config.utils || config.utils["auto-reconnect"] !== false) scheduleReconnect();
     });
 
     bot.on("kicked", (reason) => {
-      addLog(`[Bot] Kicked: ${reason}`);
+      log("[Bot] Kicked: " + reason);
       botState.connected = false;
     });
 
     bot.on("error", (err) => {
-      addLog(`[Bot] Error: ${err.message || err}`);
-      botState.errors.push({ message: String(err.message || err), time: Date.now() });
-      if (botState.errors.length > 50) botState.errors = botState.errors.slice(-25);
+      log("[Bot] Error: " + (err.message || err));
     });
 
     bot.on("messagestr", (msg) => {
-      if (config.utils && config.utils["chat-log"]) {
-        addLog(`[Chat] ${msg}`);
-      }
+      if (config.utils && config.utils["chat-log"]) log("[Chat] " + msg);
     });
   } catch (e) {
-    addLog(`[Bot] createBot failed: ${e.message}`);
+    log("[Bot] createBot failed: " + e.message);
     scheduleReconnect();
   }
 }
 
-process.on("uncaughtException", (err) => {
-  addLog(`[FATAL] uncaughtException: ${err.message}`);
-  botState.connected = false;
-  isReconnecting = false;
-  setTimeout(() => scheduleReconnect(), 8000);
-});
-
-process.on("unhandledRejection", (reason) => {
-  addLog(`[FATAL] unhandledRejection: ${reason}`);
-});
-
-process.on("SIGTERM", () => {
-  addLog("[System] SIGTERM ignored — staying alive for Wispbyte");
-});
-
-process.on("SIGINT", () => {
-  addLog("[System] SIGINT ignored — staying alive for Wispbyte");
-});
-
-addLog("=".repeat(50));
-addLog("  Minecraft AFK Bot - Wispbyte Edition");
-addLog("=".repeat(50));
-addLog(`Server: ${config.server.ip}:${config.server.port}`);
-addLog(`Version: ${config.server.version}`);
-addLog(`PORT keep-alive: ${PORT}`);
-addLog("=".repeat(50));
-
 createBot();
+console.log("[BOOT] createBot() called — process will stay alive");
